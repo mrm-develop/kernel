@@ -37,7 +37,7 @@ impl LlvmTools {
 			io::ErrorKind::NotFound,
 			"Could not find llvm-tools component\n\
 			\n\
-			Maybe the rustup component `llvm-tools` is missing? Install it through: `rustup component add llvm-tools`"
+			Maybe the rustup component `llvm-tools` is missing? Install it through: `rustup component add llvm-tools`",
 		))
 	}
 
