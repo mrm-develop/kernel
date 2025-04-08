@@ -1,51 +1,45 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use align_address::Align;
 use free_list::{AllocError, FreeList, PageLayout, PageRange};
 use hermit_sync::InterruptTicketMutex;
 use memory_addresses::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::frame::PhysFrameRangeInclusive;
-use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{Mapper, PageTableFlags, PhysFrame, Size2MiB};
 
-use crate::arch::mm::paging::identity_mapped_page_table;
-use crate::arch::x86_64::mm::paging::{BasePageSize, PageSize};
-use crate::{env, mm};
+use crate::arch::mm::paging::{self, BasePageSize, PageSize};
+use crate::env;
 
 pub static PHYSICAL_FREE_LIST: InterruptTicketMutex<FreeList<16>> =
 	InterruptTicketMutex::new(FreeList::new());
-static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
+pub static TOTAL_MEMORY: AtomicUsize = AtomicUsize::new(0);
 
-unsafe fn init_frame_range(frame_range: PageRange) {
-	let frames = {
-		use x86_64::PhysAddr;
+pub fn total_memory_size() -> usize {
+	TOTAL_MEMORY.load(Ordering::Relaxed)
+}
 
-		let start = u64::try_from(frame_range.start()).unwrap();
-		let end = u64::try_from(frame_range.end()).unwrap();
-
-		let start = PhysFrame::containing_address(PhysAddr::new(start));
-		let end = PhysFrame::containing_address(PhysAddr::new(end));
-
-		PhysFrameRangeInclusive::<Size2MiB> { start, end }
-	};
-
-	let mut physical_free_list = PHYSICAL_FREE_LIST.lock();
-
-	unsafe {
-		physical_free_list.deallocate(frame_range).unwrap();
-	}
-
-	let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-	for frame in frames {
-		let mapper_result = unsafe {
-			identity_mapped_page_table().identity_map(frame, flags, &mut *physical_free_list)
-		};
-
-		match mapper_result {
-			Ok(mapper_flush) => mapper_flush.flush(),
-			Err(MapToError::PageAlreadyMapped(current_frame)) => assert_eq!(current_frame, frame),
-			Err(err) => panic!("could not identity-map {frame:?}: {err:?}"),
+pub unsafe fn init_frame_range(frame_range: PageRange) {
+	cfg_if::cfg_if! {
+		if #[cfg(target_arch = "riscv64")] {
+			type IdentityPageSize = crate::arch::mm::paging::HugePageSize;
+		} else {
+			type IdentityPageSize = crate::arch::mm::paging::LargePageSize;
 		}
 	}
+
+	let start = frame_range
+		.start()
+		.align_down(IdentityPageSize::SIZE.try_into().unwrap());
+	let end = frame_range
+		.end()
+		.align_up(IdentityPageSize::SIZE.try_into().unwrap());
+
+	unsafe {
+		PHYSICAL_FREE_LIST.lock().deallocate(frame_range).unwrap();
+	}
+
+	(start..end)
+		.step_by(IdentityPageSize::SIZE.try_into().unwrap())
+		.map(|addr| PhysAddr::new(addr.try_into().unwrap()))
+		.for_each(paging::identity_map::<IdentityPageSize>);
 
 	TOTAL_MEMORY.fetch_add(frame_range.len().get(), Ordering::Relaxed);
 }
@@ -78,14 +72,14 @@ fn detect_from_fdt() -> Result<(), ()> {
 			let size = m.size.unwrap() as u64;
 			let end_address = start_address + size;
 
-			if end_address <= mm::kernel_end_address().as_u64() {
+			if end_address <= super::kernel_end_address().as_u64() {
 				continue;
 			}
 
 			found_ram = true;
 
-			let start_address = if start_address <= mm::kernel_start_address().as_u64() {
-				mm::kernel_end_address()
+			let start_address = if start_address <= super::kernel_start_address().as_u64() {
+				super::kernel_end_address()
 			} else {
 				VirtAddr::new(start_address)
 			};
@@ -100,12 +94,38 @@ fn detect_from_fdt() -> Result<(), ()> {
 	if found_ram { Ok(()) } else { Err(()) }
 }
 
-pub fn init() {
-	detect_from_fdt().unwrap();
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn detect_from_limits() -> Result<(), ()> {
+	let limit = crate::arch::kernel::get_limit();
+	if limit == 0 {
+		return Err(());
+	}
+
+	#[cfg(target_arch = "riscv64")]
+	let ram_address = crate::arch::kernel::get_ram_address().as_usize();
+	#[cfg(target_arch = "aarch64")]
+	let ram_address = 0;
+
+	let range =
+		PageRange::new(super::kernel_end_address().as_usize(), ram_address + limit).unwrap();
+	unsafe {
+		init_frame_range(range);
+	}
+
+	Ok(())
 }
 
-pub fn total_memory_size() -> usize {
-	TOTAL_MEMORY.load(Ordering::Relaxed)
+pub fn init() {
+	if let Err(_err) = detect_from_fdt() {
+		cfg_if::cfg_if! {
+			if #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))] {
+				error!("Could not detect physical memory from FDT");
+				detect_from_limits().unwrap();
+			} else {
+				panic!("Could not detect physical memory from FDT");
+			}
+		}
+	}
 }
 
 pub fn allocate(size: usize) -> Result<PhysAddr, AllocError> {
@@ -161,6 +181,11 @@ pub fn allocate_aligned(size: usize, align: usize) -> Result<PhysAddr, AllocErro
 /// This function must only be called from mm::deallocate!
 /// Otherwise, it may fail due to an empty node pool (POOL.maintain() is called in virtualmem::deallocate)
 pub fn deallocate(physical_address: PhysAddr, size: usize) {
+	#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+	assert!(
+		physical_address >= PhysAddr::new(crate::mm::kernel_end_address().as_u64()),
+		"Physical address {physical_address:#X} is not >= KERNEL_END_ADDRESS"
+	);
 	assert!(size > 0);
 	assert_eq!(
 		size % BasePageSize::SIZE as usize,
@@ -171,9 +196,8 @@ pub fn deallocate(physical_address: PhysAddr, size: usize) {
 	);
 
 	let range = PageRange::from_start_len(physical_address.as_u64() as usize, size).unwrap();
-
-	unsafe {
-		PHYSICAL_FREE_LIST.lock().deallocate(range).unwrap();
+	if let Err(_err) = unsafe { PHYSICAL_FREE_LIST.lock().deallocate(range) } {
+		error!("Unable to deallocate {range:?}");
 	}
 }
 

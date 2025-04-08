@@ -6,11 +6,12 @@ use memory_addresses::{PhysAddr, VirtAddr};
 use x86_64::instructions::port::Port;
 use x86_64::structures::paging::PhysFrame;
 
+use crate::arch::x86_64::mm::paging;
 use crate::arch::x86_64::mm::paging::{
 	BasePageSize, PageSize, PageTableEntryFlags, PageTableEntryFlagsExt,
 };
-use crate::arch::x86_64::mm::{paging, virtualmem};
 use crate::env;
+use crate::mm::virtualmem;
 
 /// Memory at this physical address is supposed to contain a pointer to the Extended BIOS Data Area (EBDA).
 const EBDA_PTR_LOCATION: PhysAddr = PhysAddr::new(0x0000_040e);
@@ -281,7 +282,7 @@ fn detect_rsdp(start_address: PhysAddr, end_address: PhysAddr) -> Result<&'stati
 			let frame = PhysFrame::<BasePageSize>::containing_address(x86_64::PhysAddr::new(
 				current_address as u64,
 			));
-			paging::identity_map(frame);
+			paging::identity_map::<BasePageSize>(frame.start_address().into());
 			current_page = current_address / BasePageSize::SIZE as usize;
 		}
 
@@ -335,7 +336,7 @@ fn detect_acpi() -> Result<&'static AcpiRsdp, ()> {
 
 	// Get the address of the EBDA.
 	let frame = PhysFrame::<BasePageSize>::containing_address(EBDA_PTR_LOCATION.into());
-	paging::identity_map(frame);
+	paging::identity_map::<BasePageSize>(frame.start_address().into());
 	let ebda_ptr_location: &u16 =
 		unsafe { &*(VirtAddr::from(EBDA_PTR_LOCATION.as_u64()).as_ptr()) };
 	let ebda_address = PhysAddr::new(u64::from(*ebda_ptr_location) << 4);
