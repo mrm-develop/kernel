@@ -33,13 +33,11 @@ impl LlvmTools {
 				return Ok(Self { bin });
 			}
 		}
-		eprintln!(
-			"Error: Could not find the required LLVM tool '{}'. Searched in: {:?}",
-			example_exe, rustlib
-		);
 		Err(io::Error::new(
 			io::ErrorKind::NotFound,
-			"Required LLVM tool not found",
+			"Could not find llvm-tools component\n\
+			\n\
+			Maybe the rustup component `llvm-tools` is missing? Install it through: `rustup component add llvm-tools`"
 		))
 	}
 
